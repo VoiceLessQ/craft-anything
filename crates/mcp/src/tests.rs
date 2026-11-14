@@ -343,23 +343,53 @@ fn always_for_this_project_on_a_consent_card_is_remembered() {
             }
         })
     };
+    let script = json!({"steps": [{"goto": "http://127.0.0.1:9/"}], "capture": {"end": true}});
     let once = answerer(false);
-    assert_eq!(server.ask_consent("web_session_run", "why", &CancelToken::default()), Some(true));
+    assert_eq!(server.ask_consent("web_walkthrough_record", &script, "why", &CancelToken::default()), Some(true));
     once.join().unwrap();
     assert!(Workspace::open(&ws.root).unwrap().manifest.allowed_actions.is_empty());
 
-    // Always: remembered as `tool:<id>`, and the next call isn't asked (the token is already
-    // cancelled, so asking would be refused, not waited on).
+    // Always: remembered for this call, and the same call isn't asked again, whatever the order of
+    // its fields (the token is already cancelled, so asking would be refused, not waited on).
     let always = answerer(true);
-    assert_eq!(server.ask_consent("web_session_run", "why", &CancelToken::default()), Some(true));
+    assert_eq!(server.ask_consent("web_walkthrough_record", &script, "why", &CancelToken::default()), Some(true));
     always.join().unwrap();
-    assert_eq!(Workspace::open(&ws.root).unwrap().manifest.allowed_actions, vec!["tool:web_session_run".to_string()]);
+    let kept = Workspace::open(&ws.root).unwrap().manifest.allowed_actions;
+    assert!(kept.len() == 1 && kept[0].starts_with("tool:web_walkthrough_record:"), "{kept:?}");
     let cancelled = CancelToken::default();
     cancelled.cancel();
-    assert_eq!(server.ask_consent("web_session_run", "why", &cancelled), Some(true), "not asked again");
+    let reordered = json!({"capture": {"end": true}, "steps": [{"goto": "http://127.0.0.1:9/"}]});
+    assert_eq!(server.ask_consent("web_walkthrough_record", &reordered, "why", &cancelled), Some(true), "not asked again");
     assert!(inbox.pending().is_empty());
+
+    // Other parameters are asked about: "always" covered what the card showed, with secrets hidden.
+    let other = json!({"steps": [{"goto": "http://127.0.0.1:9/other"}], "storage": {"password": "hunter2-sk-test"}});
+    let refuser = {
+        let inbox = Inbox::new(root.clone());
+        std::thread::spawn(move || {
+            for _ in 0..400 {
+                if let Some(r) = inbox.pending().first() {
+                    inbox.answer(&r.id, &Answer { allow: Some(false), ..Default::default() }).unwrap();
+                    return r.detail.clone();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            String::new()
+        })
+    };
+    assert_eq!(server.ask_consent("web_walkthrough_record", &other, "why", &CancelToken::default()), Some(false));
+    let card = refuser.join().unwrap();
+    assert!(card.contains("127.0.0.1:9/other") && !card.contains("hunter2"), "{card}");
     // Another tool is still asked about.
-    assert_eq!(server.ask_consent("browser_other", "why", &cancelled), Some(false));
+    assert_eq!(server.ask_consent("browser_other", &script, "why", &cancelled), Some(false));
+}
+
+/// A consent card shows a long call's start and says how much of it is cut.
+#[test]
+fn a_consent_card_says_how_much_of_a_long_call_it_leaves_out() {
+    let shown = card_parameters(&json!({"script": "x".repeat(5_000)}));
+    assert!(shown.chars().count() < 2_100 && shown.ends_with("more characters not shown)"), "{shown}");
+    assert_eq!(card_parameters(&json!({"a": 1})), r#"{"a":1}"#);
 }
 
 /// #855, #856: In restricted mode, tools that act on the machine (build_command_run, plugins_add,

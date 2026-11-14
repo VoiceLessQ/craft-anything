@@ -560,7 +560,7 @@ impl Server {
         let opts = |c: Consent| CallOptions::new(Caller::Mcp).with_consent(c).with_cancel(token.clone()).with_progress(&progress);
         match self.engine.call(name, args.clone(), opts(consent)) {
             // With an inbox, the person approves in the app instead of the call failing.
-            Err(e) if e.code == craft_anything_evidence::ErrorCode::ConsentRequired => match self.ask_consent(name, &e.message, token) {
+            Err(e) if e.code == craft_anything_evidence::ErrorCode::ConsentRequired => match self.ask_consent(name, &args, &e.message, token) {
                 Some(true) => self.engine.call(name, args, opts(Consent::Granted)),
                 Some(false) => Err(ToolError::new(craft_anything_evidence::ErrorCode::ConsentRequired, "the person declined this action")
                     .with_remediation("Continue without it, or explain why it's needed and ask again.")),
@@ -574,19 +574,25 @@ impl Server {
     /// there is no inbox.
     ///
     /// "Always for this project" is remembered in the project (the inbox's folder is the project's,
-    /// `allowed_actions` as `tool:<id>`), and a tool the person already always allowed isn't asked
-    /// about again (#563: it was asked every time, whatever was chosen).
-    fn ask_consent(&self, name: &str, why: &str, token: &CancelToken) -> Option<bool> {
+    /// `allowed_actions` as `tool:<id>:<sha256 of the parameters>`), and a call the person already
+    /// always allowed isn't asked about again (#563: it was asked every time, whatever was chosen).
+    /// Only that call: every tool asked about here runs code or changes a device, so, as with a
+    /// shell command, "always" covers what the card showed and nothing else.
+    fn ask_consent(&self, name: &str, args: &Value, why: &str, token: &CancelToken) -> Option<bool> {
         let dir = self.engine.session().ext.get::<craft_anything_engine::inbox::InboxDir>()?;
         let inbox = craft_anything_engine::inbox::Inbox::new(dir.0.clone());
-        let kind = format!("tool:{name}");
+        let kind = format!("tool:{name}:{}", craft_anything_evidence::sha256_hex(craft_anything_evidence::canonical_json(args).as_bytes()));
         let mut project = dir.0.parent().and_then(|root| craft_anything_engine::workspace::Workspace::open(root).ok());
         if project.as_ref().is_some_and(|p| p.manifest.allowed_actions.contains(&kind)) {
             return Some(true);
         }
         let title = self.engine.registry().get(name).map(|s| s.title).unwrap_or(name);
+        let detail = format!(
+            "{why}\n\nWith: {}\n\n\"Always\" covers this call with exactly these parameters; a call with others is asked about again.",
+            card_parameters(args)
+        );
         let id =
-            inbox.post(craft_anything_engine::inbox::RequestKind::Approval, &format!("Allow: {title}"), why, Vec::new(), false, Some(kind.clone())).ok()?;
+            inbox.post(craft_anything_engine::inbox::RequestKind::Approval, &format!("Allow: {title}"), &detail, Vec::new(), false, Some(kind.clone())).ok()?;
         let answer = inbox.wait(&id, Duration::from_secs(30 * 60), &|| token.is_cancelled());
         let allowed = answer.as_ref().and_then(|a| a.allow).unwrap_or(false);
         if allowed
@@ -824,6 +830,20 @@ fn send_to(out: &Writer, msg: &Value) {
     if w.write_all(line.as_bytes()).and_then(|_| w.flush()).is_err() {
         log::warn!("MCP client went away while writing");
     }
+}
+
+/// Characters of a call's parameters shown on its consent card.
+const CARD_PARAMETER_CHARS: usize = 2_000;
+
+/// A call's parameters for its consent card: secrets hidden, and a long one says how much is cut.
+fn card_parameters(args: &Value) -> String {
+    let line = craft_anything_engine::journal::scrubbed_line(&craft_anything_engine::journal::redacted(args).to_string());
+    let mut shown: String = line.chars().take(CARD_PARAMETER_CHARS).collect();
+    let more = line.chars().count().saturating_sub(CARD_PARAMETER_CHARS);
+    if more > 0 {
+        shown.push_str(&format!(" … ({more} more characters not shown)"));
+    }
+    shown
 }
 
 fn tool_error_body(e: &ToolError) -> Value {

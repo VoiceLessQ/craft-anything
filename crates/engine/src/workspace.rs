@@ -425,7 +425,7 @@ pub struct Manifest {
     /// build recorded it (a failed study, or a capture copied in), so a run studies again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_deep: Option<bool>,
-    /// Kinds of agent action the person allowed for this workspace ("bash:npm", "web_fetch"…).
+    /// Kinds of agent action the person allowed for this workspace ("bash:npm run build", "web_fetch"…).
     #[serde(default)]
     pub allowed_actions: Vec<String>,
     /// The agent's last plain-words summary, shown when the project is reopened.

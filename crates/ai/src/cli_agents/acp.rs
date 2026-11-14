@@ -82,12 +82,12 @@ pub enum Out {
     Event(AgentEvent),
     /// The current message is answered (or failed); the conversation is free again.
     TurnEnded,
-    /// Ask the approver about a permission request (`tool` and `input` in the approval policy's
-    /// shape: `Write {file_path}`, `Bash {command}`…), then [`AcpCore::answer`] it.
+    /// Ask the approver about a permission request (actions as `tool` and `input` in the approval
+    /// policy's shape: `Write {file_path}`, `Bash {command}`…), then [`AcpCore::answer`] it.
     Decide {
         call_id: String,
-        tool: String,
-        input: Value,
+        /// Every action the request covers; it is allowed only if each one is.
+        actions: Vec<(String, Value)>,
     },
 }
 
@@ -110,23 +110,53 @@ pub struct ModelMetadata {
     pub config_options: Vec<Value>,
 }
 
-/// An ACP tool call in the approval policy's shape.
-fn policy_action(call: &Value) -> (String, Value) {
+/// A path quoted as the approval policy reads a command back (it is checked, never run).
+fn policy_word(p: &str) -> String {
+    if p.contains('\'') && !p.contains('"') { format!("\"{p}\"") } else { crate::ssh::shell_quote(p) }
+}
+
+/// An ACP tool call in the approval policy's shape, as actions that must each be allowed: one per
+/// file it names, and a delete as the `rm` it is.
+fn policy_actions(call: &Value) -> Vec<(String, Value)> {
     let s = |p: &str| call.pointer(p).and_then(Value::as_str).map(str::to_string);
-    let path =
-        s("/locations/0/path").or_else(|| s("/rawInput/path")).or_else(|| s("/rawInput/file_path")).or_else(|| s("/rawInput/abs_path")).unwrap_or_default();
+    let mut paths: Vec<String> = call
+        .get("locations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    for p in ["/rawInput/path", "/rawInput/file_path", "/rawInput/abs_path"].into_iter().filter_map(&s) {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
     let command = match call.pointer("/rawInput/command") {
         Some(Value::String(c)) => c.clone(),
         Some(Value::Array(parts)) => parts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
         _ => s("/title").unwrap_or_default(),
     };
+    let each = |tool: &str| -> Vec<(String, Value)> {
+        if paths.is_empty() {
+            vec![(tool.to_string(), json!({"file_path": ""}))]
+        } else {
+            paths.iter().map(|p| (tool.to_string(), json!({"file_path": p}))).collect()
+        }
+    };
     match call.get("kind").and_then(Value::as_str).unwrap_or("other") {
-        "edit" | "delete" | "move" => ("Write".into(), json!({"file_path": path})),
-        "execute" => ("Bash".into(), json!({"command": command})),
-        "read" | "search" => ("Read".into(), json!({"file_path": path})),
-        "fetch" => ("WebFetch".into(), call.get("rawInput").cloned().unwrap_or(Value::Null)),
-        "think" | "switch_mode" => ("TodoWrite".into(), Value::Null),
-        _ => (s("/title").unwrap_or_else(|| "an unnamed tool".into()), call.get("rawInput").cloned().unwrap_or(Value::Null)),
+        // As the `rm` it is, so the delete rules apply as they do to the builder's own commands.
+        "delete" if !paths.is_empty() => {
+            let words: Vec<String> = paths.iter().map(|p| policy_word(p)).collect();
+            vec![("Bash".into(), json!({"command": format!("rm -- {}", words.join(" "))}))]
+        }
+        // One that names no file is decided as a change to an unknown one, never as a bare `rm`.
+        "delete" | "edit" | "move" => each("Write"),
+        "execute" => vec![("Bash".into(), json!({"command": command}))],
+        "read" | "search" => each("Read"),
+        "fetch" => vec![("WebFetch".into(), call.get("rawInput").cloned().unwrap_or(Value::Null))],
+        "think" | "switch_mode" => vec![("TodoWrite".into(), Value::Null)],
+        _ => vec![(s("/title").unwrap_or_else(|| "an unnamed tool".into()), call.get("rawInput").cloned().unwrap_or(Value::Null))],
     }
 }
 
@@ -529,8 +559,7 @@ impl AcpCore {
         let title = if s("title").is_empty() { "Use a tool".to_string() } else { s("title") };
         self.asks.insert(call_id.clone(), (id, options));
         if self.decides {
-            let (tool, input) = policy_action(call);
-            return vec![Out::Decide { call_id, tool, input }];
+            return vec![Out::Decide { call_id, actions: policy_actions(call) }];
         }
         vec![Out::Event(AgentEvent::ConsentNeeded {
             call_id,
@@ -655,10 +684,10 @@ impl Shared {
                     let _ = tx.send(e);
                 }
                 Out::TurnEnded => busy.store(false, Ordering::SeqCst),
-                Out::Decide { call_id, tool, input } => {
+                Out::Decide { call_id, actions } => {
                     let (sh, tx2, busy2, approver, id) = (shared.clone(), tx.clone(), busy.clone(), self.approver.clone(), call_id.clone());
                     let spawned = std::thread::Builder::new().name("acp-approval".into()).spawn(move || {
-                        let allow = approver.is_some_and(|a| a(&tool, &input));
+                        let allow = approver.is_some_and(|a| actions.iter().all(|(tool, input)| a(tool, input)));
                         let mut g = sh.lock().unwrap_or_else(PoisonError::into_inner);
                         if let Some(s) = g.as_mut() {
                             let outs = s.core.answer(&id, allow);
@@ -1499,11 +1528,11 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt
         let outs = c.line(
             r#"{"jsonrpc":"2.0","id":4,"method":"session/request_permission","params":{"toolCall":{"toolCallId":"t","title":"Edit App.tsx","kind":"edit","locations":[{"path":"/w/project/app/src/App.tsx"}]},"options":[{"optionId":"ok","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}}"#,
         );
-        let [Out::Decide { call_id, tool, input }] = &outs[..] else { panic!("{outs:?}") };
-        assert_eq!((tool.as_str(), input), ("Write", &json!({"file_path": "/w/project/app/src/App.tsx"})));
+        let [Out::Decide { call_id, actions }] = &outs[..] else { panic!("{outs:?}") };
+        assert_eq!(actions, &vec![("Write".to_string(), json!({"file_path": "/w/project/app/src/App.tsx"}))]);
         assert_eq!(sent(&c.answer(call_id, false))[0]["result"]["outcome"]["optionId"], "no");
 
-        let run = |kind: &str, raw: Value| policy_action(&json!({"kind": kind, "title": "t", "rawInput": raw}));
+        let run = |kind: &str, raw: Value| policy_actions(&json!({"kind": kind, "title": "t", "rawInput": raw})).remove(0);
         assert_eq!(run("execute", json!({"command": "npm run build"})), ("Bash".to_string(), json!({"command": "npm run build"})));
         assert_eq!(run("execute", json!({"command": ["cargo", "build"]})).1, json!({"command": "cargo build"}));
         assert_eq!(run("read", json!({"path": "/a"})).0, "Read");
@@ -1714,5 +1743,20 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt
         let out = sent(&c.cancel());
         assert!(out.iter().any(|m| m["id"] == 5 && m["result"]["outcome"]["outcome"] == "cancelled"));
         assert!(out.iter().any(|m| m["method"] == "session/cancel" && m["params"]["sessionId"] == "s"));
+    }
+
+    #[test]
+    fn a_delete_is_checked_as_the_rm_it_is_and_an_edit_on_every_file_it_names() {
+        let delete = policy_actions(&json!({"kind": "delete", "locations": [{"path": "/home/me/notes.txt"}, {"path": "/w/project/app/it's.txt"}]}));
+        assert_eq!(delete, vec![("Bash".to_string(), json!({"command": "rm -- /home/me/notes.txt \"/w/project/app/it's.txt\""}))]);
+        let unnamed = policy_actions(&json!({"kind": "delete", "title": "Delete files"}));
+        assert_eq!(unnamed, vec![("Write".to_string(), json!({"file_path": ""}))], "a delete that names no file is no bare rm");
+        let edit = policy_actions(&json!({
+            "kind": "edit",
+            "locations": [{"path": "/w/project/app/a.ts"}, {"path": "/home/me/.bashrc"}],
+            "rawInput": {"file_path": "/w/project/app/a.ts"}
+        }));
+        let files: Vec<(&str, &str)> = edit.iter().map(|(t, i)| (t.as_str(), i["file_path"].as_str().unwrap_or_default())).collect();
+        assert_eq!(files, vec![("Write", "/w/project/app/a.ts"), ("Write", "/home/me/.bashrc")]);
     }
 }

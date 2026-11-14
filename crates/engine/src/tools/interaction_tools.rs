@@ -315,13 +315,18 @@ fn own_program(part: &str, app: &Path) -> bool {
     !prog.is_empty() && bases.iter().any(|b| resolve(b, prog).is_some_and(|p| inside(app, &p) && p != app && p.is_file()))
 }
 
+/// What "always for this project" on a command card keeps: the whole command (spaces evened out),
+/// so it allows that command again and nothing else that starts the same way.
+fn command_key(command: &str) -> String {
+    format!("bash:{}", command.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 /// Decide a Bash command: every `&&`-joined part must be a safe build command, the game engine's
 /// own build, the builder's own program in app/, or a `cd` that stays inside the project, with
 /// no other shell control characters.
 fn decide_command(cmd: &str, app: &Path) -> Decision {
     let c = cmd.trim();
-    let first = c.split_whitespace().next().unwrap_or_default();
-    let ask = || Decision::Ask { title: format!("Run a command: `{}`", c.chars().take(300).collect::<String>()), kind: format!("bash:{first}") };
+    let ask = || Decision::Ask { title: format!("Run a command: `{}`", c.chars().take(300).collect::<String>()), kind: command_key(c) };
     if c.is_empty() {
         return Decision::Deny("Empty command.".into());
     }
@@ -366,7 +371,7 @@ pub fn decide(ws: Option<&Workspace>, tool: &str, input: &Value) -> Decision {
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     let kind = match tool {
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "edit-outside".to_string(),
-        "Bash" => format!("bash:{}", s("command").split_whitespace().next().unwrap_or_default()),
+        "Bash" => command_key(&s("command")),
         "WebFetch" | "WebSearch" => "web".to_string(),
         other => other.to_string(),
     };
@@ -619,7 +624,7 @@ pub fn kinds_of(ws: Option<&Workspace>, tool: &str, input: &Value) -> Vec<Action
     kinds
 }
 
-/// Whether "always for this project" on a card of this kind remembers that one action (`bash:npm`,
+/// Whether "always for this project" on a card of this kind remembers that one action (`bash:npm run build`,
 /// a tool's name) rather than allowing the whole kind. Pushes, deletes outside the project and
 /// system changes are allowed whole: "always" on a push allows pushing, and an earlier "always" on
 /// some other command that starts the same way (`cd`) doesn't.
@@ -869,7 +874,7 @@ pub(crate) fn ask_approval(ctx: &mut Ctx<'_>, inbox: &Inbox, ws: Option<&mut Wor
 /// What "always for this project" on a card keeps.
 #[derive(Debug, PartialEq)]
 enum Remember {
-    /// That one action, in `allowed_actions` (`bash:npm`).
+    /// That one action, in `allowed_actions` (`bash:npm run build`).
     Action(String),
     /// The whole kind, as the project's choice (`approvals`).
     Kind(ActionKind),
@@ -1629,5 +1634,33 @@ mod tests {
         for own in ["craft.json", "inbox/a.json", "feed.json"] {
             assert!(matches!(decide(Some(&w), "Write", &file(own)), Decision::Ask { .. }), "{own}");
         }
+    }
+
+    #[test]
+    fn always_keeps_the_whole_command_not_its_first_word() {
+        let (_d, mut w) = ws();
+        let Outcome::Ask { remember: Remember::Action(action), .. } = outcome(Some(&w), false, "Bash", &json!({"command": "lsblk  -f"})) else {
+            panic!("asked first")
+        };
+        assert_eq!(action, "bash:lsblk -f");
+        w.manifest.allowed_actions.push(action);
+        assert_eq!(outcome(Some(&w), false, "Bash", &json!({"command": "lsblk -f"})), Outcome::Allow, "the same command, spacing aside");
+        assert!(matches!(outcome(Some(&w), false, "Bash", &json!({"command": "lsblk -a"})), Outcome::Ask { .. }), "not another one that starts the same way");
+        // "Always" on running the tests doesn't cover running any other Python.
+        w.manifest.allowed_actions.push(command_key("python3 -m pytest"));
+        assert_eq!(outcome(Some(&w), false, "Bash", &json!({"command": "python3 -m pytest"})), Outcome::Allow);
+        assert!(matches!(outcome(Some(&w), false, "Bash", &json!({"command": "python3 -c 'import os'"})), Outcome::Ask { .. }));
+    }
+
+    #[test]
+    fn a_quoted_delete_outside_the_project_is_still_a_delete() {
+        // Quoted as an ACP delete arrives: `'…'`, or `"…"` around an apostrophe. The temp folder
+        // counts as the project's, so the files outside are under /srv.
+        let (_d, w) = ws();
+        let rm = |path: &str| outcome(Some(&w), true, "Bash", &json!({"command": format!("rm -- {path}")}));
+        assert!(matches!(rm("'/srv/other people/notes.txt'"), Outcome::Refuse(_)), "Auto mode refuses it as it would the builder's own rm");
+        assert!(matches!(rm("\"/srv/someone's/notes.txt\""), Outcome::Refuse(_)));
+        let inside = w.app_dir().join("it's.txt").display().to_string();
+        assert_eq!(rm(&format!("\"{inside}\"")), Outcome::Allow, "a file in the project may go");
     }
 }
