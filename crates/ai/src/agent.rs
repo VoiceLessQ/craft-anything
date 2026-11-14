@@ -10,7 +10,7 @@ use crate::model::{Block, ChatModel, Delta, Effort, Msg, Speaker, Stop, StopReas
 use crate::price::{self, Meter};
 use crate::prompt;
 use crate::{AgentEvent, Conversation, TurnFailure};
-use craft_anything_engine::{CallOptions, Caller, CancelToken, Consent, Engine, Registry, ToolOutput, Toolset};
+use craft_anything_engine::{CallOptions, Caller, CancelToken, Consent, Effects, Engine, Registry, ToolOutput, Toolset};
 use craft_anything_evidence::{ErrorCode, ToolError};
 use craft_anything_platform::sync::Mutex;
 use serde_json::{Value, json};
@@ -48,6 +48,10 @@ pub trait ToolHost: Send + Sync {
     fn clean_room(&self) -> bool;
     /// A tool's title (for consent prompts).
     fn title(&self, id: &str) -> String;
+    /// Whether a tool's results carry content from the target (sent to the model marked as data).
+    fn carries_target_content(&self, _id: &str) -> bool {
+        false
+    }
     /// Every toolset in use (built-in and added at run time).
     fn toolsets(&self) -> Vec<Toolset> {
         Toolset::ALL.to_vec()
@@ -148,6 +152,10 @@ impl ToolHost for EngineHost {
     fn title(&self, id: &str) -> String {
         self.0.registry().get(id).map(|s| s.title.to_string()).unwrap_or_else(|| id.to_string())
     }
+
+    fn carries_target_content(&self, id: &str) -> bool {
+        self.0.registry().get(id).is_some_and(|s| s.effects.contains(Effects::CARRIES_TARGET_CONTENT))
+    }
 }
 
 /// The engine with only the tools that change nothing: no files written, nothing started, no
@@ -191,6 +199,9 @@ impl ToolHost for ReadOnlyHost {
     }
     fn title(&self, id: &str) -> String {
         self.0.title(id)
+    }
+    fn carries_target_content(&self, id: &str) -> bool {
+        self.0.carries_target_content(id)
     }
 }
 
@@ -902,7 +913,11 @@ impl AgentLoop {
                         None => {}
                     }
                 }
-                let (text, summary, ev) = compact(&out);
+                let (mut text, summary, ev) = compact(&out);
+                // Target content reaches the model marked as data, as MCP clients get it.
+                if matches!(&out, ToolOutput::Evidence(e) if e.carries_target_content) || self.host.carries_target_content(name) {
+                    text = format!("{}\n{text}", craft_anything_engine::TARGET_CONTENT_NOTE);
+                }
                 (text, true, summary, ev)
             }
             Err(e) => (error_text(&e), false, e.message.clone(), None),
@@ -1251,11 +1266,14 @@ pub(crate) mod tests {
         }
         fn toolset_of(&self, id: &str) -> Option<Toolset> {
             match id {
-                "look" => Some(Toolset::Core),
+                "look" | "dump" => Some(Toolset::Core),
                 "build_command_run" => Some(Toolset::Core),
                 "danger" => Some(Toolset::Runtime),
                 _ => None,
             }
+        }
+        fn carries_target_content(&self, id: &str) -> bool {
+            id == "dump"
         }
         fn call(&self, id: &str, input: Value, consent: bool, _c: CancelToken) -> Result<ToolOutput, ToolError> {
             self.calls.lock().unwrap().push((id.to_string(), consent));
@@ -1301,6 +1319,33 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("timed out: {all:?}");
+    }
+
+    /// Results that carry target content reach the model marked as data, as MCP clients get them.
+    #[test]
+    fn target_content_reaches_the_model_marked_as_data() {
+        let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let uses = vec![
+            Block::ToolUse { id: "a".into(), name: "dump".into(), input: json!({}) },
+            Block::ToolUse { id: "b".into(), name: "look".into(), input: json!({}) },
+        ];
+        let script = Scripted {
+            turns: VecDeque::from([turn(uses, StopReason::ToolUse), turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn)]),
+            seen: seen.clone(),
+        };
+        let slot =
+            ModelSlot { name: "Fake".into(), model: Box::new(script), local: false, effort: None, max_turns: 10, context_tokens: 0, tools: Default::default() };
+        let mut c = ApiConversation::start(host, vec![slot], LoopConfig::default()).unwrap();
+        c.send("What's in it?");
+        drain_until_done(&mut c, |_, _| {});
+        let seen = seen.lock().unwrap();
+        let text = |i: usize| match &seen[1].last().unwrap().blocks[i] {
+            Block::ToolResult { content, .. } => content.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(text(0).starts_with(craft_anything_engine::TARGET_CONTENT_NOTE), "{}", text(0));
+        assert!(!text(1).contains(craft_anything_engine::TARGET_CONTENT_NOTE), "{}", text(1));
     }
 
     #[test]
