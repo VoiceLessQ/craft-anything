@@ -540,14 +540,17 @@ impl AcpCore {
         })]
     }
 
-    /// Answer a permission request: the first option of the matching kind, once.
+    /// Answer a permission request: the first option of the matching kind, once. "Always" is
+    /// ours to remember, not the agent's: with no one-time allow on offer, an allow is cancelled
+    /// rather than given for every later call, which would then never be asked of us.
     pub fn answer(&mut self, call_id: &str, allow: bool) -> Vec<Out> {
         let Some((id, options)) = self.asks.remove(call_id) else { return Vec::new() };
+        let kind = |o: &Value| o.get("kind").and_then(Value::as_str).map(str::to_string);
         let want = if allow { "allow_once" } else { "reject_once" };
         let pick = options
             .iter()
-            .find(|o| o.get("kind").and_then(Value::as_str) == Some(want))
-            .or_else(|| options.iter().find(|o| o.get("kind").and_then(Value::as_str).is_some_and(|k| k.starts_with(if allow { "allow" } else { "reject" }))))
+            .find(|o| kind(o).as_deref() == Some(want))
+            .or_else(|| options.iter().filter(|_| !allow).find(|o| kind(o).is_some_and(|k| k.starts_with("reject"))))
             .and_then(|o| o.get("optionId").cloned());
         let outcome = match pick {
             Some(option) => json!({"outcome": "selected", "optionId": option}),
@@ -1441,6 +1444,21 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt
         let reply = sent(&c.answer(call_id, true));
         assert_eq!(reply[0], json!({"jsonrpc": "2.0", "id": 7, "result": {"outcome": {"outcome": "selected", "optionId": "yes"}}}));
         assert!(c.answer(call_id, true).is_empty(), "answered once");
+    }
+
+    #[test]
+    fn an_allow_is_never_given_as_the_agents_always() {
+        let ask = r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t2","title":"Run npm test","kind":"execute"},"options":[{"optionId":"yes-always","name":"Always","kind":"allow_always"},{"optionId":"never","name":"Never","kind":"reject_always"}]}}"#;
+        let mut c = core(None);
+        let ev = events(c.line(ask));
+        let Some(AgentEvent::ConsentNeeded { call_id, .. }) = ev.first() else { panic!("{ev:?}") };
+        let reply = sent(&c.answer(call_id, true));
+        assert_eq!(reply[0]["result"]["outcome"], json!({"outcome": "cancelled"}), "no one-time allow on offer, so none is given");
+        let mut c = core(None);
+        let ev = events(c.line(ask));
+        let Some(AgentEvent::ConsentNeeded { call_id, .. }) = ev.first() else { panic!("{ev:?}") };
+        let reply = sent(&c.answer(call_id, false));
+        assert_eq!(reply[0]["result"]["outcome"], json!({"outcome": "selected", "optionId": "never"}), "a refusal may still use the only refusal there is");
     }
 
     /// #271: after `initialize` failed, the next message waited for a session forever, and Stop

@@ -511,8 +511,26 @@ pub fn with_setting(settings: &Settings, key: &str, value: Value) -> Result<Sett
     Ok(next)
 }
 
+/// Settings that decide what an agent may do, which programs run and where keys go. Only the
+/// person changes these; an agent may still tighten the three switches (see [`agent_may_set`]).
+const PERSON_ONLY: &[&str] = &["ask_before_running", "auto_mode", "deep_mode", "questions", "existing_files", "engines", "plugins", "ai", "assets"];
+
+/// Whether an agent may set `key` to `value`: anything outside [`PERSON_ONLY`], and the three
+/// switches only towards asking more and looking less.
+pub fn agent_may_set(key: &str, value: &Value) -> bool {
+    let top = key.split('.').next().unwrap_or_default().trim();
+    match (key.trim(), value) {
+        ("ask_before_running", Value::Bool(true)) | ("auto_mode" | "deep_mode", Value::Bool(false)) => true,
+        _ => !PERSON_ONLY.contains(&top),
+    }
+}
+
 fn settings_set(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: SetParams = parse_params(params)?;
+    if matches!(ctx.caller, crate::Caller::Mcp | crate::Caller::Agent) && !agent_may_set(&p.key, &p.value) {
+        return Err(ToolError::new(ErrorCode::NoPermission, format!("An agent can't change {:?}.", p.key))
+            .with_remediation("Ask the person to change it in Settings or with the CLI."));
+    }
     let next = with_setting(&ctx.session.settings, &p.key, p.value)?;
     let path = ctx.session.config_dir().join("config.toml");
     next.save_to(&path)?;
@@ -673,5 +691,37 @@ mod tests {
         assert_ne!(dir, crate::settings::config_dir(), "never the computer's own folder");
         assert!(e.session().settings.engines.only_configured, "changing a setting keeps the test session from finding this computer's engines");
         assert_eq!(e.session().settings.ghidra_launcher(), None);
+    }
+
+    #[test]
+    fn an_agent_cannot_loosen_settings_but_can_tighten_them() {
+        for caller in [Caller::Mcp, Caller::Agent] {
+            let mut start = crate::testing::session();
+            (start.settings.ask_before_running, start.settings.deep_mode, start.settings.auto_mode) = (true, false, false);
+            let e = Engine::new(start);
+            let call = |key: &str, value: Value| e.call("settings_set", json!({"key": key, "value": value}), CallOptions::new(caller));
+            for (key, value) in [
+                ("ask_before_running", json!(false)),
+                ("deep_mode", json!(true)),
+                ("auto_mode", json!(true)),
+                ("engines.tools", json!({"adb": "/tmp/x"})),
+                ("plugins.mcp", json!({})),
+                ("ai", json!({})),
+                ("assets.budget_usd", json!(9000.0)),
+            ] {
+                let err = call(key, value).unwrap_err();
+                assert_eq!(err.code, ErrorCode::NoPermission, "{key}: {err:?}");
+            }
+            let s = e.session();
+            assert!(s.settings.ask_before_running && !s.settings.deep_mode && !s.settings.auto_mode, "nothing was changed");
+            drop(s);
+            for (key, value) in [("ask_before_running", json!(true)), ("auto_mode", json!(false)), ("deep_mode", json!(false)), ("theme", json!("dark"))] {
+                call(key, value).unwrap_or_else(|e| panic!("{key}: {e:?}"));
+            }
+            assert!(!e.session().settings.auto_mode);
+        }
+        let e = Engine::new(crate::testing::session());
+        e.call("settings_set", json!({"key": "ask_before_running", "value": false}), CallOptions::new(Caller::Cli)).unwrap();
+        assert!(!e.session().settings.ask_before_running, "the person still can");
     }
 }

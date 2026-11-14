@@ -242,7 +242,8 @@ fn shown(ws: &Workspace, p: &Path) -> String {
 }
 
 fn refused(why: String) -> ToolError {
-    ToolError::new(ErrorCode::ConsentRequired, why)
+    // Not ConsentRequired: that code means "ask and call again", and this answer is final.
+    ToolError::new(ErrorCode::NoPermission, why)
 }
 
 fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {

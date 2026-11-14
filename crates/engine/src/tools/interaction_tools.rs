@@ -578,6 +578,9 @@ pub fn kind_of(ws: Option<&Workspace>, tool: &str, input: &Value) -> ActionKind 
             let system = |p: &Path| {
                 // Followed through links: a link in app/ to a system folder is that folder.
                 SYSTEM_DIRS.iter().any(|d| may_reach(Path::new(d), p))
+                    // Our settings and key file decide what a builder may do and where keys go
+                    // (a project kept under that folder is still the project).
+                    || (may_reach(&crate::settings::config_dir(), p) && !ws.is_some_and(|w| really_inside(&w.root, p)))
                     // The inbox (where answers are written), the manifest and the other records
                     // stay out of reach.
                     || ws.is_some_and(|w| w.is_own_record(p))

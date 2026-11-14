@@ -268,12 +268,15 @@ pub struct BudgetParams {
     pub budget_usd: Option<f64>,
 }
 
-fn project_assets_budget(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+fn project_assets_budget(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: BudgetParams = parse_params(params)?;
     let mut ws = open(&p.project)?;
     if let Some(b) = p.budget_usd {
         if !b.is_finite() || !(0.0..=10_000.0).contains(&b) {
             return Err(ToolError::invalid("budget_usd must be between 0 and 10000."));
+        }
+        if is_agent(ctx) && b > ws.manifest.asset_budget_usd {
+            return Err(person_only("An agent can't raise the project's asset budget."));
         }
         ws.set_person(|m| m.asset_budget_usd = b)?;
     }
@@ -290,10 +293,23 @@ pub struct AllowAssetsParams {
     pub allow: Option<bool>,
 }
 
-fn project_assets_allow(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+/// Whether the call comes from an agent (ours, or a client over MCP), not from the person.
+fn is_agent(ctx: &Ctx<'_>) -> bool {
+    matches!(ctx.caller, crate::Caller::Mcp | crate::Caller::Agent)
+}
+
+/// The refusal for something only the person may loosen.
+fn person_only(what: &str) -> ToolError {
+    ToolError::new(ErrorCode::NoPermission, what).with_remediation("Ask the person to do it in the app or with the CLI.")
+}
+
+fn project_assets_allow(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: AllowAssetsParams = parse_params(params)?;
     let mut ws = open(&p.project)?;
     if let Some(allow) = p.allow {
+        if is_agent(ctx) && allow && !ws.manifest.generate_assets {
+            return Err(person_only("An agent can't turn on asset generation."));
+        }
         ws.set_person(|m| m.generate_assets = allow)?;
     }
     Ok(ToolOutput::Value(json!({"generate_assets": ws.manifest.generate_assets})))
@@ -584,7 +600,7 @@ fn project_show(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     Ok(ToolOutput::Value(out))
 }
 
-fn project_inbox_answer(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+fn project_inbox_answer(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: AnswerParams = parse_params(params)?;
     let ws = open(&p.project)?;
     let inbox = Inbox::new(ws.inbox_dir());
@@ -593,6 +609,10 @@ fn project_inbox_answer(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
         return Err(ToolError::new(ErrorCode::NotFound, format!("No question {} is waiting in this project.", p.id))
             .with_remediation("Use project_show to see the questions still waiting."));
     };
+    // An approval is the person's answer: whoever asked for it can't also give it.
+    if is_agent(ctx) && (question.kind == crate::inbox::RequestKind::Approval || p.allow == Some(true)) {
+        return Err(person_only("Only the person answers an approval."));
+    }
     let answer = Answer { choice: p.choice, text: p.text, allow: p.allow, always: p.always };
     let shown = match answer.allow {
         Some(true) if answer.always => "Always allowed".to_string(),
