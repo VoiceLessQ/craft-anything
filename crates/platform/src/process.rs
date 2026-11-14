@@ -374,6 +374,7 @@ impl Process {
             readers,
             out_buf,
             err_buf,
+            ended: false,
         };
         let spawned = std::thread::Builder::new().name(format!("proc-{name}")).spawn(move || {
             let r = sup.run();
@@ -825,6 +826,18 @@ struct Supervisor {
     readers: Vec<Option<JoinHandle<()>>>,
     out_buf: Arc<Mutex<Capped>>,
     err_buf: Arc<Mutex<Capped>>,
+    /// The program was stopped and reaped by [`Supervisor::run`].
+    ended: bool,
+}
+
+/// A watcher that never ran (its thread couldn't start) or that unwound still stops what it
+/// started: without this the program would run on with no time limit and nothing to stop it.
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        if !self.ended {
+            end(self.child.as_mut(), &self.name);
+        }
+    }
 }
 
 enum Stop {
@@ -841,6 +854,7 @@ impl Supervisor {
         // Stopped, or the leader exited: take any leftover group members with it so they can't
         // hold the pipes.
         end(self.child.as_mut(), &self.name);
+        self.ended = true;
         self.drain();
         let duration = self.start.elapsed();
         let (stdout, stdout_tail, stdout_truncated) = take(&self.out_buf);

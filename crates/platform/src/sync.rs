@@ -380,14 +380,24 @@ mod tracker {
         None
     }
 
-    fn remember(r: &mut Registry, kind: ProblemKind, summary: String) {
+    /// Keeps a new problem; true when the caller should log it. Never logs here: the registry is
+    /// held, and a logger that takes one of our locks would lock the registry again.
+    #[must_use]
+    fn remember(r: &mut Registry, kind: ProblemKind, summary: String) -> bool {
         if r.dismissed.contains(&summary) || r.problems.iter().any(|p| p.summary == summary) {
-            return;
+            return false;
         }
-        log::error!("{summary}");
         r.problems.push(Problem { kind, summary, log: None });
         if r.problems.len() > KEEP_PROBLEMS {
             r.problems.remove(0);
+        }
+        true
+    }
+
+    /// Log problems [`remember`] kept, once the registry is released.
+    fn say(new: bool, summary: &str) {
+        if new {
+            log::error!("{summary}");
         }
     }
 
@@ -404,7 +414,9 @@ mod tracker {
             }
             r.waits.remove(&me);
             let text = format!("A deadlock was found and broken: {chain}.");
-            remember(&mut r, ProblemKind::Broken, text.clone());
+            let new = remember(&mut r, ProblemKind::Broken, text.clone());
+            drop(r);
+            say(new, &text);
             return Some(Verdict::Deadlock(text));
         }
         let waited = r.waits.get(&me)?.since.elapsed();
@@ -426,7 +438,9 @@ mod tracker {
             return None;
         }
         r.waits.remove(&me);
-        remember(&mut r, ProblemKind::Stuck, text.clone());
+        let new = remember(&mut r, ProblemKind::Stuck, text.clone());
+        drop(r);
+        say(new, &text);
         Some(if early { Verdict::Stuck(text) } else { Verdict::Deadlock(text) })
     }
 
@@ -441,7 +455,8 @@ mod tracker {
     }
 
     pub fn report(kind: ProblemKind, summary: String) {
-        remember(&mut registry(), kind, summary);
+        let new = remember(&mut registry(), kind, summary.clone());
+        say(new, &summary);
     }
 
     pub fn dismiss(summary: &str) {
@@ -469,8 +484,10 @@ mod tracker {
                 found.push((kind, format!("Thread '{}' at {} is waiting because {what}.", wait.thread_name, wait.at)));
             }
         }
-        for (kind, text) in found {
-            remember(&mut r, kind, text);
+        let new: Vec<String> = found.into_iter().filter_map(|(kind, text)| remember(&mut r, kind, text.clone()).then_some(text)).collect();
+        drop(r);
+        for text in new {
+            say(true, &text);
         }
     }
 

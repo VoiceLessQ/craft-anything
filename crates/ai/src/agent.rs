@@ -1006,6 +1006,15 @@ impl ApiConversation {
                             remediation: Some("Start a new chat.".into()),
                             log: None,
                         });
+                        // Whoever waits for the turn waits for this, not for the error.
+                        let _ = etx.send(AgentEvent::TurnDone {
+                            backend: String::new(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            tokens_unknown: true,
+                            cost_usd: None,
+                            cost_is_estimate: false,
+                        });
                     }
                     busy2.store(false, Ordering::SeqCst);
                 }
@@ -1028,6 +1037,14 @@ impl ApiConversation {
                 message: "The assistant isn't running any more.".into(),
                 remediation: Some("Start a new chat.".into()),
                 log: None,
+            });
+            self.queued.push(AgentEvent::TurnDone {
+                backend: String::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                tokens_unknown: true,
+                cost_usd: None,
+                cost_is_estimate: false,
             });
         }
     }

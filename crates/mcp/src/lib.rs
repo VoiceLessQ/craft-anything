@@ -133,6 +133,8 @@ pub struct Server {
     /// This connection's response budget in bytes (the client's own limit can lower it).
     budget: std::sync::atomic::AtomicUsize,
     inflight: Mutex<HashMap<String, CancelToken>>,
+    /// Clean room as last read, for answering while a tool holds the session.
+    clean: std::sync::atomic::AtomicBool,
     out: Writer,
 }
 
@@ -218,7 +220,10 @@ fn id_key(id: &Value) -> String {
 impl Server {
     pub fn new(engine: Arc<Engine>, opts: ServerOptions, writer: Box<dyn Write + Send>) -> Self {
         let budget = std::sync::atomic::AtomicUsize::new(opts.max_response_bytes);
+        // Busy at the start reads as Clean room, the shorter list.
+        let clean = std::sync::atomic::AtomicBool::new(engine.try_session().is_none_or(|s| s.clean_room()));
         Server {
+            clean,
             engine,
             opts,
             enabled: Mutex::new(BTreeSet::from([Toolset::Core])),
@@ -390,9 +395,18 @@ impl Server {
         self.visible(s.toolset) && (!clean || craft_anything_engine::clean_room::allows(s.id))
     }
 
+    /// Clean room, without waiting for the session: a running tool holds it for as long as it
+    /// runs, and the thread that lists tools is the one that reads the client's cancel.
+    fn clean_now(&self) -> bool {
+        if let Some(s) = self.engine.try_session() {
+            self.clean.store(s.clean_room(), Ordering::SeqCst);
+        }
+        self.clean.load(Ordering::SeqCst)
+    }
+
     fn tools_list(&self) -> Value {
         let registry = self.engine.registry();
-        let clean = self.engine.session().clean_room();
+        let clean = self.clean_now();
         let mut tools: Vec<Value> = Vec::new();
         for s in registry.all().iter().filter(|s| self.listed(s, clean)) {
             tools.push(registry.mcp_descriptor(s));
@@ -777,7 +791,14 @@ impl Server {
                     ),
                 ));
             }
-            return Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]}));
+            let mut out = json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]});
+            // The same mark a tool result gets: a record read this way is no more trusted.
+            if ev.carries_target_content
+                && let Some(m) = out.as_object_mut()
+            {
+                m.insert("_meta".into(), json!({"provenance": {"from_target": true}}));
+            }
+            return Ok(out);
         }
         if let Some(name) = uri.strip_prefix("investigation://") {
             let inv = investigation_tools::load(&self.engine.session());
