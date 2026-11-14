@@ -86,6 +86,7 @@ fn native_window_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
     let cancel = ctx.cancel.clone();
     ctx.report(None, format!("Starting {} for {} s…", p.program.display(), wait.as_secs()));
     let mut running = Process::new(&p.program)
+        .without_secrets()
         .args(&p.args)
         .cwd(&dir)
         .timeout(wait + Duration::from_secs(60))

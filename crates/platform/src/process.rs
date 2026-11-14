@@ -186,6 +186,14 @@ impl Process {
         self
     }
 
+    /// Start it without our credential variables ([`secret_env_names`]), for a program under study.
+    pub fn without_secrets(mut self) -> Self {
+        for k in secret_env_names() {
+            self = self.env_remove(k);
+        }
+        self
+    }
+
     /// Start from an empty environment (then add what the child needs with [`Process::env`]).
     pub fn env_clear(mut self) -> Self {
         self.env_clear = true;
@@ -1310,6 +1318,59 @@ fn windows_form(p: &str) -> String {
         rest.to_string()
     } else {
         p
+    }
+}
+
+/// Our variables named like a credential (`GITHUB_TOKEN`) or a way to one (`SSH_AUTH_SOCK`).
+pub fn secret_env_names() -> Vec<std::ffi::OsString> {
+    std::env::vars_os().map(|(k, _)| k).filter(|k| k.to_str().is_some_and(is_secret_env_name)).collect()
+}
+
+/// One part of the name is a credential word: `NPM_TOKEN` matches, `GIT_AUTHOR_NAME` doesn't.
+fn is_secret_env_name(name: &str) -> bool {
+    const PARTS: &[&str] = &[
+        "KEY",
+        "KEYS",
+        "APIKEY",
+        "TOKEN",
+        "TOKENS",
+        "SECRET",
+        "SECRETS",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "AUTH",
+        "COOKIE",
+        "PAT",
+    ];
+    const NAMES: &[&str] = &["SSH_AUTH_SOCK", "GPG_AGENT_INFO"];
+    let upper = name.to_ascii_uppercase();
+    NAMES.contains(&upper.as_str()) || upper.split(['_', '-', '.']).any(|part| PARTS.contains(&part))
+}
+
+#[cfg(test)]
+mod secret_env_tests {
+    #[test]
+    fn credential_names_are_found_by_their_parts() {
+        for name in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "FAL_KEY",
+            "GITHUB_TOKEN",
+            "gh_token",
+            "AWS_SECRET_ACCESS_KEY",
+            "NPM_CONFIG__AUTH",
+            "SSH_AUTH_SOCK",
+            "DB_PASSWORD",
+        ] {
+            assert!(super::is_secret_env_name(name), "{name}");
+        }
+        for name in ["PATH", "HOME", "GIT_AUTHOR_NAME", "XAUTHORITY", "KEYBOARD_LAYOUT", "DBUS_SESSION_BUS_ADDRESS", "TERM", "MONKEY", "TOKENIZERS_PARALLELISM"]
+        {
+            assert!(!super::is_secret_env_name(name), "{name}");
+        }
     }
 }
 

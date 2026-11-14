@@ -377,6 +377,7 @@ fn runtime_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
         observation_paths: p.watched_paths.iter().map(Into::into).collect(),
         limits: Limits { output_bytes: p.limits.output_bytes, files: p.limits.files, file_bytes: p.limits.file_bytes, watch_depth: p.limits.watch_depth },
         sandbox: if p.sandbox { SandboxRequest::IfAvailable } else { SandboxRequest::Off },
+        hide: vec![ctx.session.config_dir()],
     };
 
     let ct = ctx.cancel.clone();

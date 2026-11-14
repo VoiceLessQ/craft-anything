@@ -342,6 +342,7 @@ mod macos {
         let ct = ctx.cancel.clone();
         let mut cmd = Process::new(&lldb)
             .args(["--batch", "--no-lldbinit", "--source"])
+            .without_secrets()
             .arg(&script_path)
             .stdin(StdinMode::Closed)
             .timeout(Duration::from_millis(p.duration_ms.saturating_add(60_000)))

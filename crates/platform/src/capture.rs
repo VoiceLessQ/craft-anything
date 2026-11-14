@@ -132,6 +132,99 @@ pub enum SandboxRequest {
     IfAvailable,
 }
 
+/// bubblewrap's arguments before the program: the computer read-only, a private /tmp, secrets hidden.
+#[cfg(unix)]
+pub(crate) fn sandbox_args(var: &dyn Fn(&str) -> Option<PathBuf>, hide: &[PathBuf]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"].iter().map(OsString::from).collect();
+    // The session's runtime folder holds the SSH and GPG agents and the D-Bus bus to the keyring.
+    let extra: Vec<PathBuf> = hide.iter().cloned().chain(var("XDG_RUNTIME_DIR")).collect();
+    args.extend(hidden_secret_mounts(var("HOME").as_deref(), var("XDG_CONFIG_HOME").as_deref(), var("XDG_DATA_HOME").as_deref(), &extra));
+    args.extend(["--die-with-parent", "--unshare-pid", "--"].iter().map(OsString::from));
+    args
+}
+
+/// bubblewrap mounts that hide each credential store that exists, plus the `extra` folders.
+#[cfg(unix)]
+pub(crate) fn hidden_secret_mounts(
+    home: Option<&std::path::Path>,
+    config_home: Option<&std::path::Path>,
+    data_home: Option<&std::path::Path>,
+    extra: &[std::path::PathBuf],
+) -> Vec<OsString> {
+    const DIRS: &[&str] = &[
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".docker",
+        ".password-store",
+        ".config/gcloud",
+        ".config/gh",
+        ".config/craft-anything",
+        ".local/share/keyrings",
+        ".mozilla",
+        ".config/google-chrome",
+        ".config/chromium",
+        ".config/BraveSoftware",
+        ".thunderbird",
+    ];
+    const FILES: &[&str] = &[".netrc", ".git-credentials", ".pypirc", ".npmrc", ".cargo/credentials.toml", ".cargo/credentials"];
+    let mut dirs: Vec<std::path::PathBuf> = home.into_iter().flat_map(|h| DIRS.iter().map(move |d| h.join(d))).collect();
+    // XDG programs keep the same folders under these bases when they are set elsewhere.
+    for (base, prefix) in [(config_home, ".config/"), (data_home, ".local/share/")] {
+        let Some(base) = base else { continue };
+        dirs.extend(DIRS.iter().filter_map(|d| d.strip_prefix(prefix)).map(|d| base.join(d)));
+    }
+    dirs.extend(extra.iter().cloned());
+    dirs.sort();
+    dirs.dedup();
+    let mut out = Vec::new();
+    for dir in dirs.into_iter().filter(|d| d.is_dir()) {
+        out.push(OsString::from("--tmpfs"));
+        out.push(dir.into_os_string());
+    }
+    for file in home.into_iter().flat_map(|h| FILES.iter().map(move |f| h.join(f))).filter(|f| f.is_file()) {
+        out.extend([OsString::from("--ro-bind"), OsString::from("/dev/null"), file.into_os_string()]);
+    }
+    out
+}
+
+#[cfg(all(test, unix))]
+mod secret_mount_tests {
+    #[test]
+    fn credential_folders_and_files_are_covered_only_when_they_exist() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.path().join(".config/craft-anything")).unwrap();
+        std::fs::write(home.path().join(".netrc"), "machine x login y password z").unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config_home.path().join("gh")).unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let args = super::hidden_secret_mounts(Some(home.path()), Some(config_home.path()), None, &[extra.path().to_path_buf()]);
+        let shown: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let tmpfs = |p: &std::path::Path| shown.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == p.to_string_lossy());
+        assert!(tmpfs(&home.path().join(".ssh")) && tmpfs(&home.path().join(".config/craft-anything")), "{shown:?}");
+        assert!(tmpfs(&config_home.path().join("gh")) && tmpfs(extra.path()), "XDG and extra folders: {shown:?}");
+        let netrc = home.path().join(".netrc").to_string_lossy().into_owned();
+        assert!(shown.windows(3).any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == netrc), "{shown:?}");
+        assert!(!shown.iter().any(|a| a.ends_with(".gnupg") || a.ends_with(".aws") || a.ends_with("gcloud")), "nothing that isn't there: {shown:?}");
+        assert!(super::hidden_secret_mounts(None, None, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_sandbox_hides_the_sessions_agents_and_bus() {
+        let runtime = tempfile::tempdir().unwrap();
+        let var = |name: &str| (name == "XDG_RUNTIME_DIR").then(|| runtime.path().to_path_buf());
+        let shown: Vec<String> = super::sandbox_args(&var, &[]).iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let at = shown.iter().position(|a| *a == runtime.path().to_string_lossy()).expect("the runtime folder is hidden");
+        assert_eq!(shown[at - 1], "--tmpfs", "{shown:?}");
+        assert_eq!(shown.last().map(String::as_str), Some("--"), "the program comes right after: {shown:?}");
+        let bare = super::sandbox_args(&|_: &str| None, &[]);
+        assert!(!bare.iter().any(|a| a.to_string_lossy() == runtime.path().to_string_lossy()), "{bare:?}");
+    }
+}
+
 /// Everything one capture needs.
 #[derive(Debug, Clone)]
 pub struct Spec {
@@ -150,6 +243,8 @@ pub struct Spec {
     pub observation_paths: Vec<PathBuf>,
     pub limits: Limits,
     pub sandbox: SandboxRequest,
+    /// Folders a sandboxed run also hides, such as our own config folder.
+    pub hide: Vec<PathBuf>,
 }
 
 // --------------------------------------------------------------------------------------------
@@ -358,6 +453,10 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
             native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 }).map_err(|e| failed(&e))?;
         let mut cmd = CommandBuilder::new(program.as_os_str());
         cmd.args(args);
+        // Only Frida runs here, and it starts the program under study: none of our credentials.
+        for k in crate::process::secret_env_names() {
+            cmd.env_remove(k);
+        }
         (master, slave.spawn_command(cmd).map_err(|e| failed(&e))?)
     };
     let mut reader = master.try_clone_reader().map_err(|e| failed(&e))?;
@@ -530,6 +629,7 @@ mod piped {
         let started = now();
         let mut p = Process::new(&spec.executable)
             .args(&spec.args)
+            .without_secrets()
             .timeout(spec.timeout)
             .idle_timeout(spec.idle_timeout)
             .stdout_cap(spec.limits.output_bytes)
@@ -635,6 +735,7 @@ mod piped {
                 observation_paths: Vec::new(),
                 limits: Limits::default(),
                 sandbox: SandboxRequest::Off,
+                hide: Vec::new(),
             };
             let never: Cancel = std::sync::Arc::new(|| false);
             let only_errors = capture(spec(&["/c", "echo oops 1>&2 & exit 2"], 10_000), never.clone()).unwrap();
@@ -867,11 +968,8 @@ mod unix {
             ),
             SandboxRequest::IfAvailable => match &bwrap {
                 Some(path) => {
-                    let args: Vec<OsString> =
-                        ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--die-with-parent", "--unshare-pid", "--"]
-                            .iter()
-                            .map(OsString::from)
-                            .collect();
+                    let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from).filter(|p| p.is_absolute());
+                    let args = super::sandbox_args(&var, &spec.hide);
                     (Sandbox { available: true, used: true, kind: "bubblewrap", reason: None }, path.clone().into_os_string(), args)
                 }
                 None => (
@@ -882,6 +980,7 @@ mod unix {
             },
         };
 
+        let sandboxed = sandbox.used;
         // Snapshot the filesystem before running.
         let fs_before = if spec.observation_paths.is_empty() { None } else { Some(snapshot(&spec.observation_paths, &spec.limits, &cancel)) };
 
@@ -905,6 +1004,10 @@ mod unix {
         }
         if let Some(cwd) = &spec.cwd {
             cmd.cwd(cwd);
+        }
+        // The program under study gets none of our credentials; what the run sets still applies.
+        for k in crate::process::secret_env_names() {
+            cmd.env_remove(k);
         }
         for (k, v) in &spec.env {
             cmd.env(k, v);
@@ -1103,6 +1206,17 @@ mod unix {
             code: "capture_is_observational".into(),
             message: "A capture shows one run under one set of inputs; other inputs may behave differently.".into(),
         }];
+        limitations.push(if sandboxed {
+            Limitation {
+                code: "sandbox_scope".into(),
+                message: "The sandbox gave the program a read-only view of this computer with credential folders and the session's agents and keyring connection hidden, and key-like environment variables removed; it could still reach the network and read other files.".into(),
+            }
+        } else {
+            Limitation {
+                code: "not_sandboxed".into(),
+                message: "The program ran with your user's access, less key-like environment variables: it could read and change your files and reach the network.".into(),
+            }
+        });
         let mut residual = Vec::new();
         if !reader_done {
             limitations.push(Limitation {
@@ -1231,6 +1345,7 @@ mod tests {
             observation_paths: Vec::new(),
             limits: Limits::default(),
             sandbox: SandboxRequest::Off,
+            hide: Vec::new(),
         };
         let cap = capture(spec, no_cancel()).unwrap();
         assert_eq!(cap.exit.reason, "exited");
@@ -1259,6 +1374,7 @@ mod tests {
             observation_paths: Vec::new(),
             limits: Limits::default(),
             sandbox: SandboxRequest::Off,
+            hide: Vec::new(),
         };
         let t = Instant::now();
         let cap = capture(spec, no_cancel()).unwrap();
@@ -1289,6 +1405,7 @@ mod tests {
             observation_paths: Vec::new(),
             limits: Limits::default(),
             sandbox: SandboxRequest::Off,
+            hide: Vec::new(),
         };
         let cap = capture(spec, no_cancel()).unwrap();
         assert_eq!(cap.exit.reason, "timeout");
@@ -1321,6 +1438,7 @@ mod tests {
             observation_paths: Vec::new(),
             limits: Limits::default(),
             sandbox: SandboxRequest::Off,
+            hide: Vec::new(),
         };
         let cap = capture(spec, no_cancel()).unwrap();
         let group = i32::try_from(cap.exit.leader_pid.unwrap()).unwrap();
@@ -1353,6 +1471,7 @@ mod tests {
             observation_paths: Vec::new(),
             limits: Limits::default(),
             sandbox: SandboxRequest::Off,
+            hide: Vec::new(),
         };
         let cap = capture(spec, no_cancel()).unwrap();
         assert!(cap.terminal.lines.iter().any(|l| l.contains("ping")), "{:?}", cap.terminal.lines);
@@ -1383,6 +1502,7 @@ mod tests {
             observation_paths: vec![watch.clone()],
             limits: Limits::default(),
             sandbox: SandboxRequest::Off,
+            hide: Vec::new(),
         };
         let cap = capture(spec, no_cancel()).unwrap();
         let fs = cap.filesystem.expect("filesystem snapshot");

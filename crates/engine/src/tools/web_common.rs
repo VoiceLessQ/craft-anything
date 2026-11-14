@@ -215,6 +215,7 @@ impl Browser {
         let sink = tail.clone();
         let mut proc = Process::new(&exe)
             .args(&args)
+            .without_secrets()
             .stdin(StdinMode::Closed)
             .timeout(Duration::from_secs(opts.startup_secs.saturating_add(3600)))
             .cancel_when(move || cancel.is_cancelled())
@@ -259,6 +260,7 @@ impl Browser {
         let sink = tail.clone();
         let mut proc = Process::new(exe)
             .args(&args)
+            .without_secrets()
             .stdin(StdinMode::Closed)
             .timeout(Duration::from_secs(startup_secs.saturating_add(3600)))
             .cancel_when(move || cancel.is_cancelled())

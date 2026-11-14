@@ -137,6 +137,7 @@ impl RizinSession {
         let push_err = push.clone();
         let mut proc = Process::new(rizin)
             .args(start_args(&target))
+            .without_secrets()
             .stdin(StdinMode::Piped)
             // A debugging session can sit idle for a long time; closing it or the session end stops it.
             .timeout(Duration::from_secs(8 * 3600))

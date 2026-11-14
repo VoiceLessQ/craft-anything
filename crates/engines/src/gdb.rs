@@ -262,6 +262,7 @@ impl GdbSession {
         let push_err = push.clone();
         let mut proc = Process::new(gdb)
             .args(&a)
+            .without_secrets()
             .env("DEBUGINFOD_URLS", "")
             .stdin(StdinMode::Piped)
             // A debugging session can sit idle for a long time; closing it or the session end stops it.

@@ -140,8 +140,13 @@ impl Frida {
     }
 
     fn proc(&self, program: &Path, remediation: &str) -> Process {
-        let mut p =
-            Process::new(program).timeout(self.wall).stdout_cap(8 * 1024 * 1024).stderr_cap(512 * 1024).label("frida").remediation(remediation.to_string());
+        let mut p = Process::new(program)
+            .without_secrets()
+            .timeout(self.wall)
+            .stdout_cap(8 * 1024 * 1024)
+            .stderr_cap(512 * 1024)
+            .label("frida")
+            .remediation(remediation.to_string());
         if let Some(idle) = self.idle {
             p = p.idle_timeout(idle);
         }
