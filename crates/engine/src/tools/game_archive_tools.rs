@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 const MAX_INDEX: u64 = 512 << 20;
 /// The largest compressed block taken (Unreal's default block is 64 KiB).
 const MAX_BLOCK: u64 = 16 << 20;
+/// Most one compression block may inflate to.
+const MAX_BLOCK_OUT: u64 = 64 << 20;
 
 pub fn specs() -> Vec<ToolSpec> {
     vec![
@@ -1315,16 +1317,28 @@ impl<W: Write> Sink<W> {
     }
 }
 
+/// A zlib entry's blocks are each inside the pak, no larger than [`MAX_BLOCK`], and in order
+/// without overlap: a block listed twice would be inflated twice.
+fn blocks_in_order(blocks: &[(u64, u64)], pak_len: u64) -> bool {
+    let mut next = 0u64;
+    blocks.iter().all(|&(start, end)| {
+        let ok = start >= next && start <= end && end <= pak_len && end - start <= MAX_BLOCK;
+        next = end;
+        ok
+    })
+}
+
 /// Copy `e` out of the pak into `sink`: stored bytes as they are, zlib blocks inflated.
 fn copy_entry<W: Write>(pak: &mut Pak, e: &Entry, zlib: bool, sink: &mut Sink<W>, out: &Path, cancel: &CancelToken) -> Result<(), ToolError> {
     if zlib {
+        if !blocks_in_order(&e.blocks, pak.len) {
+            return Err(damaged(format!("the blocks of {} overlap or lie outside it", shown(e))));
+        }
         for &(start, end) in &e.blocks {
             cancel.check()?;
-            if start > end || end > pak.len || end - start > MAX_BLOCK {
-                return Err(damaged(format!("a block of {} lies outside it", shown(e))));
-            }
             let raw = read_at(&mut pak.file, &pak.path, start, end - start)?;
-            let room = e.uncompressed_size.saturating_sub(sink.written);
+            // No more than the file still needs, nor more than one block may hold.
+            let room = e.uncompressed_size.saturating_sub(sink.written).min(MAX_BLOCK_OUT);
             let block = craft_anything_formats::firmware::inflate(&raw, true, room, true)
                 .map_err(|err| damaged(format!("a block of {} didn't inflate ({err})", shown(e))))?;
             sink.put(&block.data.unwrap_or_default(), out)?;
@@ -2201,5 +2215,16 @@ mod tests {
         for bad in ["../x", "Maps/../../x", "C:/x", "a\\..\\b", "", "a//b", "./x"] {
             assert_eq!(super::inside(root, bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn pak_blocks_must_be_in_order_without_repeats() {
+        assert!(super::blocks_in_order(&[(100, 200), (200, 300)], 1_000));
+        assert!(super::blocks_in_order(&[], 1_000));
+        assert!(!super::blocks_in_order(&[(100, 200), (100, 200)], 1_000), "the same block twice");
+        assert!(!super::blocks_in_order(&[(200, 300), (100, 200)], 1_000), "out of order");
+        assert!(!super::blocks_in_order(&[(100, 2_000)], 1_000), "past the end");
+        assert!(!super::blocks_in_order(&[(300, 200)], 1_000), "backwards");
+        assert!(!super::blocks_in_order(&[(0, super::MAX_BLOCK + 1)], u64::MAX), "too large");
     }
 }
