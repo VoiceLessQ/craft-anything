@@ -69,7 +69,9 @@ fn write_impl(path: &Path, bytes: &[u8], private: bool) -> Result<(), ToolError>
     };
     std::fs::create_dir_all(&dir).map_err(|e| ToolError::io(dir.display(), e))?;
     let existing_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
-    let (tmp, mut f) = create_temp(&dir, path, private, &COUNTER)?;
+    // Owner-only from the first open when the file it replaces may be private too: its own
+    // permissions are put back below, before anything is written.
+    let (tmp, mut f) = create_temp(&dir, path, private || existing_perms.is_some(), &COUNTER)?;
     let result = (|| {
         if private {
             set_private(&tmp)?;
@@ -154,7 +156,15 @@ pub fn backup_once(from: &Path, to: &Path) -> Result<bool, ToolError> {
         return Ok(false);
     }
     let bytes = std::fs::read(from).map_err(|e| ToolError::io(from.display(), e))?;
-    let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(to) {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Owner-only from the first open: a config can hold keys, and a later chmod leaves a window.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut f = match options.open(to) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(ToolError::io(to.display(), e)),

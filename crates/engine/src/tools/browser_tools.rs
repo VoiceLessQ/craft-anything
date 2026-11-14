@@ -922,6 +922,8 @@ fn passive_evidence(
             "Cookies, authorization headers and storage values are never kept; JSON bodies are reduced to outlines and declared secrets are redacted.",
         ))
         .coverage(Coverage { status: CoverageStatus::Partial, examined: None, total: None, next_offset: None })
+        // Titles, addresses, console and script text: all written by the page.
+        .target_content(true)
         .location(Location::new("url", origin.to_string()));
     if let Some(partial) = outlines_partial {
         b = b.limitation(partial);

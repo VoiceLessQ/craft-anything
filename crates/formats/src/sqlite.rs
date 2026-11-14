@@ -30,6 +30,8 @@ const MAX_DEPTH: usize = 64;
 pub const MAX_ROWS: usize = 100_000;
 /// Most schema objects listed.
 const MAX_SCHEMA_OBJECTS: usize = 100_000;
+/// Most values retained by one row walk, whatever the rows' shape.
+const MAX_RETAINED_VALUES: usize = 2_000_000;
 /// Longest schema text read whole (SQLite's own default limit on a statement is 1,000,000
 /// bytes). A CREATE statement is parsed whole, so the columns, rowid alias and `WITHOUT ROWID`
 /// after its first [`MAX_TEXT`] bytes still count; the statement shown is cut at [`MAX_TEXT`].
@@ -215,6 +217,9 @@ struct RowWalk {
     /// Longest text value decoded whole, and the whole text still allowed above [`MAX_TEXT`].
     text_cap: usize,
     text_budget: usize,
+    /// Values still allowed across every retained row: rows and columns are each capped, and
+    /// cells may share one record's bytes, so their product needs a limit of its own.
+    values_left: usize,
 }
 
 impl RowWalk {
@@ -231,6 +236,7 @@ impl RowWalk {
             skip: 0,
             text_cap: MAX_TEXT,
             text_budget: 0,
+            values_left: MAX_RETAINED_VALUES,
         }
     }
 
@@ -241,6 +247,16 @@ impl RowWalk {
         if self.seen <= self.skip {
             return;
         }
+        let Some(left) = self.values_left.checked_sub(row.values.len()) else {
+            if !self.incomplete {
+                self.notes.push(format!("Stopped after {} rows: they hold as many values as are kept at once.", self.out.len()));
+            }
+            self.incomplete = true;
+            // Ends the walk: every loop stops once `seen` reaches `want`.
+            self.want = self.seen;
+            return;
+        };
+        self.values_left = left;
         if self.text_cap > MAX_TEXT {
             let text: usize = row.values.iter().map(|value| if let CellValue::Text { text, .. } = value { text.len() } else { 0 }).sum();
             self.text_budget = self.text_budget.saturating_sub(text);
@@ -466,7 +482,7 @@ impl<'a> SqliteDb<'a> {
         w.text_cap = MAX_SCHEMA_TEXT;
         w.text_budget = MAX_SCHEMA_TEXT_TOTAL;
         self.collect_table_rows(&mut w, 1, 0);
-        let truncated = w.out.len() >= MAX_SCHEMA_OBJECTS;
+        let truncated = w.out.len() >= MAX_SCHEMA_OBJECTS || w.values_left < MAX_COLUMNS;
         for row in w.out {
             // sqlite_schema columns: type, name, tbl_name, rootpage, sql.
             let get_text = |i: usize| match row.values.get(i) {

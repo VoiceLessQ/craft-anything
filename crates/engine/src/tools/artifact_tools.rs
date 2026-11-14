@@ -881,18 +881,34 @@ fn core_archive_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         "zip" | "apk" | "ipa" | "jar" | "hap" | "msix" => {
             let z = zip::parse(&bytes, p.max_files.saturating_mul(2)).map_err(|e| ToolError::new(ErrorCode::GarbledOutput, e.to_string()))?;
             listing_truncated = z.truncated;
+            // What is unpacked is held until it's written, so the limits apply while reading:
+            // each member may take only what is left of the total, and none after the count.
+            let (mut held, mut kept) = (0u64, 0usize);
             for e in z.entries.iter().filter(|e| !e.is_dir) {
                 if let Some(kind) = e.special_kind() {
                     members.push((e.name.clone(), Member::Skip(format!("{kind} member is not a regular file"))));
                     continue;
                 }
-                match zip::read_entry(&bytes, e, p.max_bytes) {
-                    Ok(d) => members.push((e.name.clone(), Member::Owned(d))),
+                let left = p.max_bytes.saturating_sub(held);
+                if kept >= p.max_files || left == 0 {
+                    members.push((e.name.clone(), Member::Skip("file count or size limit reached".into())));
+                    continue;
+                }
+                match zip::read_entry(&bytes, e, left) {
+                    Ok(d) => {
+                        held = held.saturating_add(d.len() as u64);
+                        kept += 1;
+                        members.push((e.name.clone(), Member::Owned(d)));
+                    }
                     Err(err @ zip::ZipError::CrcMismatch { .. }) => {
                         contradictions.push(json!({"path": e.name, "reason": err.to_string()}));
                         let m = if p.if_tampered == IntegrityPolicy::Continue {
-                            match zip::read_entry_unverified(&bytes, e, p.max_bytes) {
-                                Ok(d) => Member::Owned(d),
+                            match zip::read_entry_unverified(&bytes, e, left) {
+                                Ok(d) => {
+                                    held = held.saturating_add(d.len() as u64);
+                                    kept += 1;
+                                    Member::Owned(d)
+                                }
                                 Err(read_err) => Member::Skip(read_err.to_string()),
                             }
                         } else {

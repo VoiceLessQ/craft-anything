@@ -96,10 +96,8 @@ fn fetch(pin: &crate::Pin, store: &Path, folder: &str, what: &str, cancel: Optio
     let incoming = store.join(format!(".{folder}.incoming"));
     let _ = std::fs::remove_dir_all(&incoming);
     let dest = store.join(folder);
-    let swapped = crate::install::unpack(&data, pin.format, &incoming, pin.strip_prefix, cancel.as_ref(), &|_| {}).and_then(|_| {
-        let _ = std::fs::remove_dir_all(&dest);
-        std::fs::rename(&incoming, &dest).map_err(|e| ToolError::io(dest.display(), e))
-    });
+    let swapped = crate::install::unpack(&data, pin.format, &incoming, pin.strip_prefix, cancel.as_ref(), &|_| {})
+        .and_then(|_| crate::install::swap_in(&incoming, &dest));
     if swapped.is_err() {
         let _ = std::fs::remove_dir_all(&incoming);
     }

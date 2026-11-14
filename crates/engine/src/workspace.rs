@@ -940,9 +940,23 @@ impl Workspace {
         self.assets().iter().fold(0.0, |spent, a| spent + a.cost_usd)
     }
 
+    /// The asset list for a decision or a save: only a missing file is an empty list. One that
+    /// can't be read or understood is an error, never "nothing spent" to budget from or save over.
+    pub fn assets_checked(&self) -> Result<Vec<AssetRecord>, ToolError> {
+        let path = self.root.join(ASSETS);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                ToolError::new(ErrorCode::FileError, format!("{} (the project's list of generated assets) can't be read: {e}", path.display()))
+                    .with_remediation("Fix or move that file aside, then try again; a moved file starts the list, and what was spent, from nothing.")
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(ToolError::io(path.display(), e)),
+        }
+    }
+
     /// Add a generated asset to the list.
     pub fn record_asset(&self, rec: AssetRecord) -> Result<(), ToolError> {
-        let mut all = self.assets();
+        let mut all = self.assets_checked()?;
         all.push(rec);
         let json = serde_json::to_vec_pretty(&all).map_err(|e| ToolError::internal(e.to_string()))?;
         write_atomic(&self.root.join(ASSETS), &json)

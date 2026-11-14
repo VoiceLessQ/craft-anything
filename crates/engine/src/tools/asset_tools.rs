@@ -9,7 +9,7 @@
 use crate::inbox::Inbox;
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use crate::tools::interaction_tools::{Verdict, ask_approval, inbox, inside, resolve, workspace_of};
-use crate::workspace::{AssetRecord, Workspace};
+use crate::workspace::{AssetRecord, Workspace, really_inside};
 use craft_anything_engines::assets::{AssetProvider, AssetProviders, AssetRequest, Catalogue, Generated, Shape, about_usd, fal, usd};
 use craft_anything_evidence::{ErrorCode, ToolError};
 use schemars::JsonSchema;
@@ -164,7 +164,9 @@ fn save_path(ws: &Workspace, save_as: &str, ext: &str) -> Result<(PathBuf, Strin
     let app = ws.app_dir();
     // Paths given from the workspace ("app/Assets/x.glb") mean the same place.
     let rel = save_as.trim().trim_start_matches("./").trim_start_matches("app/").trim_start_matches("app\\");
-    let path = resolve(&app, rel).filter(|p| inside(&app, p) && *p != app).ok_or_else(|| ToolError::invalid("save_as must be a file path inside app/"))?;
+    let path = resolve(&app, rel)
+        .filter(|p| inside(&app, p) && really_inside(&app, p) && *p != app)
+        .ok_or_else(|| ToolError::invalid("save_as must be a file path inside app/"))?;
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) {
         return Err(ToolError::invalid(format!("save_as must end in .{ext}")));
     }
@@ -174,7 +176,8 @@ fn save_path(ws: &Workspace, save_as: &str, ext: &str) -> Result<(PathBuf, Strin
 
 /// Go ahead if this stays within the budget, else ask the person (unless they said "always").
 fn within_budget(ctx: &mut Ctx<'_>, inbox: &Inbox, ws: &mut Workspace, cost: f64) -> Result<(), ToolError> {
-    let spent = ws.assets_spent();
+    // Checked: a list that can't be read is not a budget with nothing spent.
+    let spent = ws.assets_checked()?.iter().fold(0.0, |spent, a| spent + a.cost_usd);
     let budget = ws.manifest.asset_budget_usd;
     if spent + cost <= budget + 1e-9 || ws.manifest.allowed_actions.iter().any(|k| k == OVER_BUDGET) {
         return Ok(());
@@ -317,7 +320,7 @@ fn image_source(ws: &Workspace, image: &str) -> Result<String, ToolError> {
         return Ok(image.to_string());
     }
     let path = resolve(&ws.root, image)
-        .filter(|p| inside(&ws.root, p))
+        .filter(|p| inside(&ws.root, p) && really_inside(&ws.root, p))
         .ok_or_else(|| ToolError::invalid("image must be a web address or a picture inside the project"))?;
     let media = match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("png") => "image/png",

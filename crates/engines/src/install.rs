@@ -116,10 +116,9 @@ pub fn install(
     };
 
     let dest = store_dir.join(engine_id);
-    let _ = std::fs::remove_dir_all(&dest);
-    if let Err(e) = std::fs::rename(&incoming, &dest) {
+    if let Err(e) = swap_in(&incoming, &dest) {
         let _ = std::fs::remove_dir_all(&incoming);
-        return Err(ToolError::io(dest.display(), e));
+        return Err(e);
     }
 
     let located = crate::locate(engine_id, &NoOverrides, store_dir);
@@ -446,6 +445,32 @@ fn unpack_tar(data: &[u8], dest: &Path, strip_prefix: Option<&str>, cancel: Opti
     Ok(written)
 }
 
+/// Put the unpacked `incoming` folder in `dest`'s place. The copy already there is moved aside
+/// first and put back if the new one can't take its place, so a failed reinstall (a program
+/// still running from it) leaves the working engine as it was.
+pub(crate) fn swap_in(incoming: &Path, dest: &Path) -> Result<(), ToolError> {
+    let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("engine");
+    let aside = dest.with_file_name(format!(".{name}.previous-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&aside);
+    let had = match std::fs::rename(dest, &aside) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(ToolError::io(dest.display(), e).with_remediation("Close the programs still running from that folder, then install again."));
+        }
+    };
+    if let Err(e) = std::fs::rename(incoming, dest) {
+        if had {
+            let _ = std::fs::rename(&aside, dest);
+        }
+        return Err(ToolError::io(dest.display(), e));
+    }
+    if had {
+        let _ = std::fs::remove_dir_all(&aside);
+    }
+    Ok(())
+}
+
 /// Turn an archive member name into safe relative components (no `..`, absolute or drive-letter
 /// paths, no NUL).
 fn safe_components(name: &str) -> Result<Vec<String>, &'static str> {
@@ -461,7 +486,9 @@ fn safe_components(name: &str) -> Result<Vec<String>, &'static str> {
         match c {
             "" | "." => {}
             ".." => return Err("path climbs out of the folder"),
-            c if c.len() == 2 && c.ends_with(':') => return Err("drive-letter path"),
+            // Any colon: `C:`, a drive-relative `C:x` (which replaces the whole path when
+            // joined on Windows) and an `a:b` stream name.
+            c if c.contains(':') => return Err("name contains ':' (a drive or stream name)"),
             c => out.push(c.to_string()),
         }
     }
@@ -747,6 +774,10 @@ mod tests {
         assert!(safe_components("/abs").is_err());
         assert!(safe_components("a/b/c").unwrap().len() == 3);
         assert!(safe_components("./a").unwrap() == vec!["a".to_string()]);
+        // On Windows a drive-relative name replaces the whole path it's joined to.
+        for name in ["C:", "C:evil/x", "c:..", "a/C:x", "file.txt:stream", "a\\D:b"] {
+            assert!(safe_components(name).is_err(), "{name}");
+        }
     }
 
     /// Downloads the real pins for this computer (about 80 MB). Run with `--ignored`.

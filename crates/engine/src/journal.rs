@@ -47,14 +47,24 @@ pub fn bounded(v: &Value) -> Value {
 const SECRET_FIELDS: &[&str] =
     &["api_key", "apikey", "secret", "password", "passphrase", "token", "access_token", "refresh_token", "authorization", "private_key", "hidden_values"];
 
+/// Tables whose every value may be a secret (a plugin's environment, a server's headers).
+const SECRET_MAPS: &[&str] = &["env", "headers"];
+
 /// `v` with the value of every secret-named field (at any depth) replaced by `"(redacted)"`.
 pub fn redacted(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
             m.iter()
                 .map(|(k, val)| {
-                    let secret = SECRET_FIELDS.iter().any(|s| k.eq_ignore_ascii_case(s));
-                    (k.clone(), if secret { json!("(redacted)") } else { redacted(val) })
+                    let secret = SECRET_FIELDS.iter().any(|s| k.eq_ignore_ascii_case(s)) || is_secret_name(k);
+                    let holds_secrets = SECRET_MAPS.iter().any(|s| k.eq_ignore_ascii_case(s));
+                    let shown = match val {
+                        _ if secret => json!("(redacted)"),
+                        // Every value of an environment or header table: any of them can be a key.
+                        Value::Object(inner) if holds_secrets => Value::Object(inner.keys().map(|name| (name.clone(), json!("(redacted)"))).collect()),
+                        _ => redacted(val),
+                    };
+                    (k.clone(), shown)
                 })
                 .collect(),
         ),
@@ -214,6 +224,24 @@ pub fn read_day(project_root: &Path, day: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::scrubbed_line as scrub;
+
+    #[test]
+    fn secret_fields_are_found_by_how_they_end_and_by_the_table_they_sit_in() {
+        let v = serde_json::json!({
+            "id": "docs",
+            "key": "auto_mode",
+            "env": {"OPENAI_API_KEY": "sk-test-env", "PLAIN_NAME": "sk-test-plain"},
+            "headers": {"X-Api-Key": "sk-test-header"},
+            "nested": {"GITHUB_TOKEN": "sk-test-token", "x-api-key": "sk-test-dash", "note": "kept"}
+        });
+        let out = super::redacted(&v).to_string();
+        for gone in ["sk-test-env", "sk-test-plain", "sk-test-header", "sk-test-token", "sk-test-dash"] {
+            assert!(!out.contains(gone), "{gone} in {out}");
+        }
+        for kept in ["docs", "auto_mode", "kept", "OPENAI_API_KEY", "PLAIN_NAME"] {
+            assert!(out.contains(kept), "{kept} missing from {out}");
+        }
+    }
 
     #[test]
     fn a_line_loses_its_secrets_and_keeps_its_words() {
