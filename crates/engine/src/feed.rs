@@ -138,7 +138,7 @@ pub fn dismiss_plan(feed: &mut Vec<FeedItem>) -> bool {
 
 /// Fold the plan card in a project's saved conversation (the UI's write, while no run is going).
 pub fn dismiss_plan_saved(ws: &Workspace) -> Result<bool, ToolError> {
-    let mut feed = load(ws);
+    let mut feed = load_to_change(ws)?;
     let folded = dismiss_plan(&mut feed);
     if folded {
         save(&ws.root, &feed)?;
@@ -167,13 +167,7 @@ struct Saved {
 /// The feed for a project: what was saved, else rebuilt from its manifest. Questions still
 /// waiting in its inbox are always there.
 pub fn load(ws: &Workspace) -> Vec<FeedItem> {
-    let saved = std::fs::read(ws.root.join(FEED_FILE)).ok().and_then(|b| {
-        serde_json::from_slice::<Saved>(&b)
-            .ok()
-            .filter(|s| s.version <= FEED_VERSION)
-            .map(|s| s.items)
-            .or_else(|| serde_json::from_slice::<Vec<FeedItem>>(&b).ok())
-    });
+    let saved = std::fs::read(ws.root.join(FEED_FILE)).ok().and_then(|b| parsed(&b));
     let Some(mut feed) = saved else { return history(ws) };
     // Nothing is streaming any more after a restart.
     for item in &mut feed {
@@ -184,6 +178,35 @@ pub fn load(ws: &Workspace) -> Vec<FeedItem> {
     let shown: HashSet<String> = feed.iter().filter_map(|i| if let FeedItem::Ask { request, .. } = i { Some(request.id.clone()) } else { None }).collect();
     feed.extend(Inbox::new(ws.inbox_dir()).pending().into_iter().filter(|r| !shown.contains(&r.id)).map(|request| FeedItem::Ask { request, answer: None }));
     feed
+}
+
+/// A saved feed's items, when this version can read them.
+fn parsed(bytes: &[u8]) -> Option<Vec<FeedItem>> {
+    serde_json::from_slice::<Saved>(bytes)
+        .ok()
+        .filter(|s| s.version <= FEED_VERSION)
+        .map(|s| s.items)
+        .or_else(|| serde_json::from_slice::<Vec<FeedItem>>(bytes).ok())
+}
+
+/// Whether a saved feed comes from a newer Craft Anything.
+fn from_newer_version(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes).ok().and_then(|v| v.get("version").and_then(Value::as_u64)).is_some_and(|v| v > u64::from(FEED_VERSION))
+}
+
+/// The feed for a change made outside a run: as [`load`], but a saved conversation that can't
+/// be read is an error, because rebuilding it from the manifest and saving that would replace it.
+fn load_to_change(ws: &Workspace) -> Result<Vec<FeedItem>, ToolError> {
+    let path = ws.root.join(FEED_FILE);
+    match std::fs::read(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ToolError::io(path.display(), e)),
+        // A newer version's feed is turned away by `save`, with its own message.
+        Ok(b) if parsed(&b).is_none() && !from_newer_version(&b) => {
+            Err(ToolError::new(ErrorCode::FileError, format!("{} (this project's conversation) can't be read, so it isn't changed.", path.display()))
+                .with_remediation("Fix that file or move it aside, then try again."))
+        }
+        _ => Ok(load(ws)),
+    }
 }
 
 /// A feed rebuilt from what a project saved: the request, the checks, the agent's last words,
@@ -208,11 +231,7 @@ pub fn save(root: &Path, feed: &[FeedItem]) -> Result<(), ToolError> {
     if !root.is_dir() {
         return Ok(());
     }
-    let newer = std::fs::read(root.join(FEED_FILE))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v.get("version").and_then(Value::as_u64))
-        .is_some_and(|v| v > u64::from(FEED_VERSION));
+    let newer = std::fs::read(root.join(FEED_FILE)).ok().is_some_and(|b| from_newer_version(&b));
     if newer {
         return Err(ToolError::new(ErrorCode::NotSupported, "This project's conversation was saved by a newer Craft Anything, so it isn't changed.")
             .with_remediation("Update Craft Anything to keep its conversation up to date."));
@@ -225,7 +244,7 @@ pub fn save(root: &Path, feed: &[FeedItem]) -> Result<(), ToolError> {
 /// question, taken before it was answered: one the saved conversation doesn't have yet (posted
 /// from outside a run) is added with its answer, rather than lost once it stops waiting (#176).
 pub fn record_answer(ws: &Workspace, request: &Request, shown: &str) -> Result<(), ToolError> {
-    let mut feed = load(ws);
+    let mut feed = load_to_change(ws)?;
     if !feed.iter().any(|i| matches!(i, FeedItem::Ask { request: r, .. } if r.id == request.id)) {
         feed.push(FeedItem::Ask { request: request.clone(), answer: None });
     }
@@ -349,5 +368,20 @@ mod tests {
         std::fs::write(ws.root.join(FEED_FILE), newer).unwrap();
         assert!(save(&ws.root, &[FeedItem::User(UserItem::Text("x".into()))]).is_err());
         assert_eq!(std::fs::read(ws.root.join(FEED_FILE)).unwrap(), newer);
+    }
+
+    #[test]
+    fn an_unreadable_conversation_is_never_replaced_by_a_rebuilt_one() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "x", "Clone it", TargetRef::None).unwrap();
+        std::fs::write(ws.root.join(FEED_FILE), b"{ cut short").unwrap();
+        let request = Inbox::new(ws.inbox_dir()).post(RequestKind::Question, "Which colour?", "", vec![], true, None).unwrap();
+        let question = Inbox::new(ws.inbox_dir()).pending().into_iter().find(|r| r.id == request).unwrap();
+        assert!(record_answer(&ws, &question, "Blue").is_err());
+        assert!(dismiss_plan_saved(&ws).is_err());
+        assert_eq!(std::fs::read(ws.root.join(FEED_FILE)).unwrap(), b"{ cut short", "the conversation is left as it was");
+        std::fs::remove_file(ws.root.join(FEED_FILE)).unwrap();
+        record_answer(&ws, &question, "Blue").unwrap();
+        assert!(load(&ws).iter().any(|i| matches!(i, FeedItem::Ask { request: r, .. } if r.id == request)), "no file yet is a fresh start");
     }
 }

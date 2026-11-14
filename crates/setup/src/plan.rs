@@ -277,7 +277,16 @@ pub struct ApplyReport {
 type Writer<'a> = &'a dyn Fn(&Path, &[u8]) -> Result<(), ToolError>;
 
 fn real_write(p: &Path, b: &[u8]) -> Result<(), ToolError> {
-    craft_anything_platform::write_atomic_private(p, b)
+    craft_anything_platform::write_atomic_private(&through_link(p), b)
+}
+
+/// Where a write to `p` lands: a config that is a symlink (dotfiles kept elsewhere) is written
+/// where it points, so the link stays a link; anything else is written in place.
+pub(crate) fn through_link(p: &Path) -> std::path::PathBuf {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
 }
 
 /// Apply a plan. Config files are written one by one with a first-time backup, an atomic write and
@@ -326,7 +335,7 @@ pub(crate) fn apply_with(plan: &Plan, write: Writer<'_>) -> ApplyReport {
     if failed {
         for (idx, path, old) in done.iter().rev() {
             let r = match old {
-                Some(t) => craft_anything_platform::write_atomic(path, t.as_bytes()).map_err(|e| e.message),
+                Some(t) => craft_anything_platform::write_atomic(&through_link(path), t.as_bytes()).map_err(|e| e.message),
                 None => match std::fs::remove_file(path) {
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
                     _ => Ok(()),
@@ -460,7 +469,7 @@ pub fn uninstall(host: &Host) -> UninstallReport {
     for (c, old, new) in targets {
         let backup = backup_path(&c.config);
         let r = craft_anything_platform::backup_once(&c.config, &backup)
-            .and_then(|_| craft_anything_platform::write_atomic_private(&c.config, new.as_bytes()))
+            .and_then(|_| craft_anything_platform::write_atomic_private(&through_link(&c.config), new.as_bytes()))
             .and_then(|_| {
                 let t = std::fs::read_to_string(&c.config).map_err(|e| ToolError::io(c.config.display(), e))?;
                 match config::read_entry(c, &t) {
@@ -472,7 +481,7 @@ pub fn uninstall(host: &Host) -> UninstallReport {
             Ok(()) => (Outcome::Removed, None),
             Err(e) => {
                 partial = true;
-                let restored = craft_anything_platform::write_atomic(&c.config, old.as_bytes()).is_ok();
+                let restored = craft_anything_platform::write_atomic(&through_link(&c.config), old.as_bytes()).is_ok();
                 (Outcome::Failed, Some(if restored { e.message } else { format!("{} Restore {} by hand.", e.message, backup.display()) }))
             }
         };

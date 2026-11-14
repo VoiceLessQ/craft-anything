@@ -594,6 +594,18 @@ pub const ACTIVITY_LOG: &str = "build-activity.log";
 /// The log before it, set aside when it grew long.
 pub const ACTIVITY_LOG_OLD: &str = "build-activity.old.log";
 
+/// `path` as JSON for a decision or a save: `None` only when it's missing, never a fresh start.
+fn read_json_strict<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<Option<T>, ToolError> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            ToolError::new(ErrorCode::FileError, format!("{} ({what}) can't be read: {e}", path.display()))
+                .with_remediation("Fix that file or move it aside, then try again; a file moved aside starts over from nothing.")
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ToolError::io(path.display(), e)),
+    }
+}
+
 /// Where [`ProjectUsage`] is kept in the project folder.
 pub const USAGE_FILE: &str = "usage.json";
 pub const USAGE_VERSION: u32 = 1;
@@ -610,7 +622,7 @@ impl ProjectUsage {
     /// Change the saved usage (the run's job). A file from a newer Craft Anything is left alone.
     pub fn update(root: &Path, f: impl FnOnce(&mut ProjectUsage)) -> Result<(), ToolError> {
         let _updating = USAGE_UPDATE.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut u = ProjectUsage::load(root);
+        let mut u: ProjectUsage = read_json_strict(&root.join(USAGE_FILE), "the project's AI usage")?.unwrap_or_default();
         if u.version > USAGE_VERSION {
             return Err(ToolError::unsupported(format!("{USAGE_FILE} was written by a newer Craft Anything, so it isn't changed.")));
         }
@@ -943,15 +955,7 @@ impl Workspace {
     /// The asset list for a decision or a save: only a missing file is an empty list. One that
     /// can't be read or understood is an error, never "nothing spent" to budget from or save over.
     pub fn assets_checked(&self) -> Result<Vec<AssetRecord>, ToolError> {
-        let path = self.root.join(ASSETS);
-        match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                ToolError::new(ErrorCode::FileError, format!("{} (the project's list of generated assets) can't be read: {e}", path.display()))
-                    .with_remediation("Fix or move that file aside, then try again; a moved file starts the list, and what was spent, from nothing.")
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(ToolError::io(path.display(), e)),
-        }
+        Ok(read_json_strict(&self.root.join(ASSETS), "the project's list of generated assets")?.unwrap_or_default())
     }
 
     /// Add a generated asset to the list.
@@ -2069,5 +2073,20 @@ mod tests {
         ws.delete().unwrap();
         assert_eq!(std::fs::read_to_string(mine.join("index.html")).unwrap(), "<p>hi</p>");
         assert!(!mine.join(MANIFEST).exists() && !mine.join("inbox").exists() && !mine.join(AGENT_SESSION_FILE).exists());
+    }
+
+    #[test]
+    fn an_unreadable_usage_or_asset_list_is_never_saved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USAGE_FILE), b"{ not json").unwrap();
+        assert!(ProjectUsage::update(dir.path(), |u| u.work_ms += 1).is_err());
+        assert_eq!(std::fs::read(dir.path().join(USAGE_FILE)).unwrap(), b"{ not json", "left as it was");
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "x", "A game", TargetRef::None).unwrap();
+        assert!(ws.assets_checked().unwrap().is_empty(), "no list yet is an empty one");
+        std::fs::write(ws.root.join(ASSETS), b"[{").unwrap();
+        let rec = AssetRecord { file: "a.glb".into(), kind: "model".into(), prompt: "x".into(), cost_usd: 1.0, at_ms: 0 };
+        assert!(ws.assets_checked().is_err() && ws.record_asset(rec).is_err());
+        assert_eq!(std::fs::read(ws.root.join(ASSETS)).unwrap(), b"[{", "what was spent isn't reset");
     }
 }

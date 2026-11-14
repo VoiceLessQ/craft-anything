@@ -266,3 +266,18 @@ fn repeated_client_ids_are_applied_once() {
     assert!(report.results.iter().all(|r| r.outcome == Outcome::Configured));
     assert_eq!(apply(&crate::plan::plan(&fx.host, &request).unwrap()).status, "unchanged");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_config_is_written_where_it_points_and_stays_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("dotfiles-config.toml");
+    std::fs::write(&real, "old").unwrap();
+    let link = dir.path().join("config.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    craft_anything_platform::write_atomic_private(&crate::plan::through_link(&link), b"new").unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+    let plain = dir.path().join("plain.toml");
+    assert_eq!(crate::plan::through_link(&plain), plain, "a path that isn't a link is used as it is");
+}

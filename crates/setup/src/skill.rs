@@ -89,7 +89,7 @@ pub fn install(skills_dir: &Path) -> Result<Vec<PathBuf>, ToolError> {
             if old.is_some() {
                 craft_anything_platform::backup_once(&path, &backup_path(&path))?;
             }
-            craft_anything_platform::write_atomic_private(&path, body.as_bytes())?;
+            craft_anything_platform::write_atomic_private(&crate::plan::through_link(&path), body.as_bytes())?;
             let back = std::fs::read(&path).map_err(|e| ToolError::io(path.display(), e))?;
             if back != body.as_bytes() {
                 return Err(ToolError::new(craft_anything_evidence::ErrorCode::FileError, format!("{} did not read back correctly", path.display())));
@@ -109,7 +109,7 @@ pub fn install(skills_dir: &Path) -> Result<Vec<PathBuf>, ToolError> {
 fn rollback(done: &[(PathBuf, Option<Vec<u8>>)]) {
     for (path, old) in done.iter().rev() {
         let r = match old {
-            Some(bytes) => craft_anything_platform::write_atomic(path, bytes).map_err(|e| e.message),
+            Some(bytes) => craft_anything_platform::write_atomic(&crate::plan::through_link(path), bytes).map_err(|e| e.message),
             None => std::fs::remove_file(path).map_err(|e| e.to_string()),
         };
         if let Err(e) = r {
